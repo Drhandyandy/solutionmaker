@@ -148,6 +148,11 @@ class DerSignatureParser:
         except Exception:
             return None
 
+
+# Alias for backward compatibility
+DERParser = DerSignatureParser
+
+
 def parse_script_sig_full(script_hex: str) -> dict:
     """
     Full parser: Returns { 'r': int, 's': int, 'pubkey': str }
