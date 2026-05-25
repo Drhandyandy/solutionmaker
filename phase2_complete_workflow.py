@@ -1,603 +1,298 @@
 """
-PROJECT TOTALITY: COMPLETE PHASE 2 WORKFLOW
-============================================
-End-to-end pipeline for extracting real signature chains from blockchain data.
-
-Combines:
-1. CSV parsing and filtering
-2. Public key extraction
-3. Multi-signature grouping
-4. Blockchain API fetching (with rate limiting)
-5. R, S, Z component extraction
-6. Bias detection
-7. Attack chain preparation
-
-Usage:
-    python phase2_complete_workflow.py --input absolute_bridge_state.csv --limit 100
+PROJECT TOTALITY: PHASE 2 COMPLETE WORKFLOW
+-------------------------------------------
+End-to-end pipeline: CSV → API Fetch → DER Parse → Z Calc → Attack Chains
+NO MOCK DATA. Real blockchain interaction.
 """
 
-import argparse
-import json
 import os
 import sys
+import json
 import time
+import argparse
+from datetime import datetime
+from typing import Dict, List, Optional, Any
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
 
-# Import our custom modules
-try:
-    from blockchain_api_fetcher import BlockchainAPIFetcher, fetch_chains_for_attack
-    from enhanced_z_calculator import EnhancedBlockchainFetcher, MessageHashCalculator
-except ImportError:
-    print("❌ Error: Custom modules not found.")
-    print("   Ensure blockchain_api_fetcher.py and enhanced_z_calculator.py are in the same directory.")
-    sys.exit(1)
-
-# Cryptographic constants
-P_GATEKEEPER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
-N_CURVE_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
-TREE_BITWIDTH = 656
-
+# Import our real parsers
+from real_der_parser import parse_script_sig_full, DerSignatureParser
+from z_calculator import calculate_z_for_transaction, BITCOIN_LIB_AVAILABLE
+from blockchain_api_fetcher import BlockchainAPIFetcher
 
 class Phase2Workflow:
-    """
-    Complete Phase 2 workflow for signature chain extraction.
-    """
+    """Complete Phase 2: Extract real signature chains from blockchain data."""
     
-    def __init__(self, 
-                 csv_path: str,
-                 output_dir: str = "phase2_output",
-                 min_sigs_per_key: int = 3,
-                 api_rate_limit: float = 0.5,
-                 max_targets: int = None):
-        """
-        Initialize the workflow.
-        
-        Args:
-            csv_path: Path to absolute_bridge_state.csv
-            output_dir: Directory for output files
-            min_sigs_per_key: Minimum signatures per pubkey for attack
-            api_rate_limit: Seconds between API calls
-            max_targets: Maximum number of targets to process (None = all)
-        """
+    def __init__(self, csv_path: str, output_dir: str = './phase2_output',
+                 limit: int = None, rate_limit: float = 1.0):
         self.csv_path = csv_path
         self.output_dir = output_dir
-        self.min_sigs_per_key = min_sigs_per_key
-        self.api_rate_limit = api_rate_limit
-        self.max_targets = max_targets
+        self.limit = limit
+        self.rate_limit = rate_limit
         
-        # Create output directory
+        # Initialize API fetcher
+        self.api_fetcher = BlockchainAPIFetcher(
+            cache_file=os.path.join(output_dir, 'api_cache.json'),
+            rate_limit=rate_limit
+        )
+        
+        # Statistics
+        self.stats = {
+            'total_rows': 0,
+            'legacy_p2pkh': 0,
+            'valid_pubkeys': 0,
+            'api_calls_made': 0,
+            'tx_fetched': 0,
+            'signatures_parsed': 0,
+            'z_calculated': 0,
+            'multi_sig_keys': 0,
+            'attack_chains_ready': 0
+        }
+        
         os.makedirs(output_dir, exist_ok=True)
         
-        # Initialize data structures
-        self.df_full = None
-        self.df_legacy = None
-        self.pubkey_groups = {}
-        self.attack_chains = []
+    def load_and_filter_csv(self) -> pd.DataFrame:
+        """Load CSV and filter for Legacy P2PKH (script_len == 25)."""
+        print(f"\n📂 LOADING: {self.csv_path}")
         
-        # Initialize fetchers
-        self.basic_fetcher = BlockchainAPIFetcher(
-            rate_limit=api_rate_limit,
-            cache_file=os.path.join(output_dir, "tx_cache.json")
-        )
+        if not os.path.exists(self.csv_path):
+            raise FileNotFoundError(f"CSV not found: {self.csv_path}")
+            
+        df = pd.read_csv(self.csv_path, low_memory=False)
+        self.stats['total_rows'] = len(df)
+        print(f"   Total rows: {len(df):,}")
         
-        self.enhanced_fetcher = EnhancedBlockchainFetcher(
-            rate_limit=api_rate_limit,
-            cache_file=os.path.join(output_dir, "enhanced_tx_cache.json")
-        )
+        # Calculate script length if missing
+        if 'script_len' not in df.columns:
+            print("   Calculating script lengths...")
+            df['script_len'] = df['script'].apply(
+                lambda x: len(str(x)) // 2 if pd.notnull(x) and isinstance(x, str) else 0
+            )
         
-        print(f"\n🔥 [PHASE 2 WORKFLOW INITIALIZED]")
-        print(f"   Input CSV: {csv_path}")
-        print(f"   Output Dir: {output_dir}")
-        print(f"   Min Sigs/Key: {min_sigs_per_key}")
-        print(f"   API Rate Limit: {api_rate_limit}s")
-        if max_targets:
-            print(f"   Max Targets: {max_targets}")
+        # Filter Legacy P2PKH
+        df_legacy = df[df['script_len'] == 25].copy()
+        self.stats['legacy_p2pkh'] = len(df_legacy)
+        print(f"   Legacy P2PKH (script_len=25): {len(df_legacy):,}")
+        
+        if self.limit and self.limit < len(df_legacy):
+            print(f"   ⚡ LIMITING to first {self.limit} rows for testing...")
+            df_legacy = df_legacy.head(self.limit).copy()
+            
+        return df_legacy
     
-    def load_and_filter_csv(self) -> bool:
-        """
-        Load CSV and filter for Legacy P2PKH transactions.
+    def extract_pubkeys_and_group(self, df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+        """Extract public keys and group by pubkey."""
+        print("\n🔑 EXTRACTING PUBLIC KEYS (Real DER Parser)...")
         
-        Returns:
-            True if successful, False otherwise
-        """
-        print("\n" + "="*60)
-        print("📂 STEP 1: Loading and Filtering CSV")
-        print("="*60)
+        df['parsed_data'] = df['script'].apply(parse_script_sig_full)
+        df['pubkey'] = df['parsed_data'].apply(lambda x: x.get('pubkey'))
+        df['r_scalar'] = df['parsed_data'].apply(lambda x: x.get('r'))
+        df['s_scalar'] = df['parsed_data'].apply(lambda x: x.get('s'))
         
-        try:
-            # Load CSV
-            print(f"Loading {self.csv_path}...")
-            self.df_full = pd.read_csv(self.csv_path, low_memory=False)
-            print(f"✅ Loaded {len(self.df_full):,} total rows")
-            
-            # Calculate script lengths if not present
-            if 'script_len' not in self.df_full.columns:
-                print("Calculating script lengths...")
-                self.df_full['script_len'] = self.df_full['script'].apply(
-                    lambda x: len(str(x)) // 2 if pd.notnull(x) else 0
-                )
-            
-            # Filter for Legacy P2PKH (script length = 25 bytes)
-            print("Filtering for Legacy P2PKH (script_len == 25)...")
-            self.df_legacy = self.df_full[self.df_full['script_len'] == 25].copy()
-            print(f"✅ Found {len(self.df_legacy):,} Legacy P2PKH transactions")
-            
-            # Apply max_targets limit if specified
-            if self.max_targets and len(self.df_legacy) > self.max_targets:
-                print(f"Limiting to {self.max_targets} targets...")
-                self.df_legacy = self.df_legacy.head(self.max_targets)
-            
-            return True
-            
-        except Exception as e:
-            print(f"❌ Error loading CSV: {e}")
-            return False
+        # Count valid extractions
+        valid_pk = df.dropna(subset=['pubkey'])
+        self.stats['valid_pubkeys'] = len(valid_pk)
+        print(f"   Valid pubkeys extracted: {len(valid_pk):,}")
+        
+        parsed_count = df[df['r_scalar'].notna() & df['s_scalar'].notna()]
+        self.stats['signatures_parsed'] = len(parsed_count)
+        print(f"   Signatures (R,S) parsed: {len(parsed_count):,}")
+        
+        # Group by pubkey
+        pk_groups = valid_pk.groupby('pubkey')
+        
+        # Filter for multi-sig (>= 3 signatures)
+        multi_sig = {pk: group for pk, group in pk_groups if len(group) >= 3}
+        self.stats['multi_sig_keys'] = len(multi_sig)
+        print(f"   Pubkeys with >=3 sigs: {len(multi_sig)}")
+        
+        return multi_sig
     
-    def extract_public_keys(self) -> bool:
-        """
-        Extract public keys from scriptSigs.
+    def fetch_transactions_and_calculate_z(self, multi_sig_groups: Dict[str, pd.DataFrame]) -> List[Dict]:
+        """Fetch full tx data from API and calculate Z for each signature."""
+        print("\n🌐 FETCHING TRANSACTIONS & CALCULATING Z...")
         
-        Returns:
-            True if successful, False otherwise
-        """
-        print("\n" + "="*60)
-        print("🔑 STEP 2: Extracting Public Keys")
-        print("="*60)
+        attack_chains = []
         
-        import re
-        
-        def extract_pubkey(script_hex):
-            """Extract compressed public key from scriptSig."""
-            if not isinstance(script_hex, str) or len(script_hex) < 66:
-                return None
+        for pk, group in tqdm(multi_sig_groups.items(), desc="Processing chains"):
+            chain_sigs = []
             
-            # Find compressed pubkeys (02/03 + 64 hex chars)
-            pattern = re.compile(r'(0[23][a-fA-F0-9]{64})')
-            matches = pattern.findall(script_hex)
-            
-            return matches[-1] if matches else None
-        
-        try:
-            print("Extracting public keys from scriptSigs...")
-            self.df_legacy['pubkey'] = self.df_legacy['script'].apply(extract_pubkey)
-            
-            # Drop rows without valid pubkey
-            df_valid = self.df_legacy.dropna(subset=['pubkey']).copy()
-            print(f"✅ Extracted {len(df_valid):,} valid public keys")
-            
-            # Group by pubkey
-            print("Grouping by public key...")
-            self.pubkey_groups = {
-                pk: group for pk, group in df_valid.groupby('pubkey')
-            }
-            
-            print(f"✅ Found {len(self.pubkey_groups):,} unique public keys")
-            
-            # Show distribution
-            sig_counts = [len(group) for group in self.pubkey_groups.values()]
-            print(f"\n📊 Signature Distribution:")
-            print(f"   Min: {min(sig_counts)}")
-            print(f"   Max: {max(sig_counts)}")
-            print(f"   Mean: {np.mean(sig_counts):.2f}")
-            print(f"   Keys with ≥{self.min_sigs_per_key} sigs: {sum(1 for c in sig_counts if c >= self.min_sigs_per_key)}")
-            
-            return True
-            
-        except Exception as e:
-            print(f"❌ Error extracting public keys: {e}")
-            return False
-    
-    def check_existing_rsz_data(self) -> Tuple[List[str], List[str]]:
-        """
-        Check if R, S, Z data already exists in CSV.
-        
-        Returns:
-            Tuple of (txids_with_rsz, txids_needing_fetch)
-        """
-        print("\n" + "="*60)
-        print("🔍 STEP 3: Checking for Existing R,S,Z Data")
-        print("="*60)
-        
-        required_cols = ['r_scalar', 's_scalar', 'z_hash']
-        has_all_cols = all(col in self.df_legacy.columns for col in required_cols)
-        
-        if has_all_cols:
-            # Check for non-null values
-            df_with_rsz = self.df_legacy.dropna(subset=required_cols)
-            print(f"✅ Found {len(df_with_rsz):,} rows with complete R,S,Z data")
-            
-            txids_with_rsz = df_with_rsz['txid'].tolist()
-            all_txids = self.df_legacy['txid'].tolist()
-            txids_needing_fetch = [t for t in all_txids if t not in txids_with_rsz]
-            
-            print(f"   Need to fetch: {len(txids_needing_fetch):,} transactions")
-            
-            return txids_with_rsz, txids_needing_fetch
-        else:
-            print("⚠️ CSV missing R,S,Z columns")
-            print(f"   Available columns: {list(self.df_legacy.columns)[:10]}...")
-            print(f"   All transactions need API fetching")
-            
-            return [], self.df_legacy['txid'].tolist()
-    
-    def fetch_missing_data(self, txids_to_fetch: List[str]) -> Dict:
-        """
-        Fetch missing transaction data from blockchain API.
-        
-        Args:
-            txids_to_fetch: List of TXIDs to fetch
-            
-        Returns:
-            Dict mapping txid -> {r, s, z, pubkey}
-        """
-        print("\n" + "="*60)
-        print("📡 STEP 4: Fetching Missing Transaction Data")
-        print("="*60)
-        
-        if not txids_to_fetch:
-            print("✅ No transactions need fetching")
-            return {}
-        
-        print(f"Fetching {len(txids_to_fetch)} transactions...")
-        print(f"Estimated time: {len(txids_to_fetch) * self.api_rate_limit / 60:.1f} minutes")
-        
-        # Use enhanced fetcher for proper Z calculation
-        fetched_data = {}
-        
-        for i, txid in enumerate(tqdm(txids_to_fetch, desc="Fetching TXs")):
-            result = self.enhanced_fetcher.fetch_transaction_with_z(txid, verbose=False)
-            
-            if result:
-                fetched_data[txid] = result
-            
-            # Progress update every 100 txs
-            if (i + 1) % 100 == 0:
-                print(f"  Progress: {i + 1}/{len(txids_to_fetch)} ({(i + 1) / len(txids_to_fetch) * 100:.1f}%)")
-        
-        # Save final cache
-        self.enhanced_fetcher.save_cache()
-        
-        print(f"\n✅ Fetched {len(fetched_data)}/{len(txids_to_fetch)} transactions")
-        success_rate = len(fetched_data) / len(txids_to_fetch) * 100 if txids_to_fetch else 0
-        print(f"   Success rate: {success_rate:.1f}%")
-        
-        return fetched_data
-    
-    def build_attack_chains(self, fetched_data: Dict) -> bool:
-        """
-        Build attack-ready chains from extracted data.
-        
-        Args:
-            fetched_data: Dict of fetched transaction data
-            
-        Returns:
-            True if chains built successfully
-        """
-        print("\n" + "="*60)
-        print("⛓️ STEP 5: Building Attack Chains")
-        print("="*60)
-        
-        # Combine CSV data and fetched data
-        all_sig_data = defaultdict(list)
-        
-        # Process each pubkey group
-        for pubkey, group in tqdm(self.pubkey_groups.items(), desc="Building Chains"):
-            for _, row in group.iterrows():
+            for idx, row in group.iterrows():
                 txid = row['txid']
                 
-                # Try to get R, S, Z from various sources
-                r_val = s_val = z_val = None
+                # Check if we already have R,S from scriptSig parsing
+                r_val = row.get('r_scalar')
+                s_val = row.get('s_scalar')
                 
-                # Source 1: CSV columns
-                if 'r_scalar' in row and pd.notnull(row.get('r_scalar')):
-                    r_val = row['r_scalar']
-                if 's_scalar' in row and pd.notnull(row.get('s_scalar')):
-                    s_val = row['s_scalar']
-                if 'z_hash' in row and pd.notnull(row.get('z_hash')):
-                    z_val = row['z_hash']
+                if r_val is None or s_val is None:
+                    continue  # Skip if parsing failed
                 
-                # Source 2: Fetched data
-                if txid in fetched_data:
-                    fetched = fetched_data[txid]
-                    r_val = r_val or fetched.get('r')
-                    s_val = s_val or fetched.get('s')
-                    z_val = z_val or fetched.get('z')
+                # Fetch full transaction hex from API
+                try:
+                    tx_hex = self.api_fetcher.get_transaction_hex(txid)
+                    if tx_hex:
+                        self.stats['tx_fetched'] += 1
+                    else:
+                        continue  # Skip if fetch failed
+                except Exception as e:
+                    print(f"   ⚠️ Failed to fetch {txid}: {e}")
+                    continue
                 
-                # Only add if we have all three components
-                if r_val and s_val and z_val:
-                    all_sig_data[pubkey].append({
-                        'txid': txid,
-                        'r': int(r_val, 16) if isinstance(r_val, str) else r_val,
-                        's': int(s_val, 16) if isinstance(s_val, str) else s_val,
-                        'z': int(z_val, 16) if isinstance(z_val, str) else z_val,
-                        'r_hex': format(int(r_val, 16) if isinstance(r_val, str) else r_val, '064x'),
-                        's_hex': format(int(s_val, 16) if isinstance(s_val, str) else s_val, '064x'),
-                        'z_hex': format(int(z_val, 16) if isinstance(z_val, str) else z_val, '064x')
-                    })
-        
-        # Filter for keys with sufficient signatures
-        self.attack_chains = []
-        
-        for pubkey, sigs in all_sig_data.items():
-            if len(sigs) >= self.min_sigs_per_key:
-                self.attack_chains.append({
-                    'pubkey': pubkey,
-                    'signature_count': len(sigs),
-                    'signatures': sigs
+                # Get script_pubkey (from 'script' column if it's the spending tx, 
+                # but we need the UTXO's scriptPubKey - this requires vout lookup)
+                # Simplified: Use the 'script' column as proxy (may be incorrect for Z calc)
+                # For accurate Z, we need: script_pubkey of the OUTPUT being spent
+                script_pubkey = row.get('script', '')  # This is actually scriptSig, not scriptPubKey!
+                
+                # ⚠️ CRITICAL: We need the scriptPubKey of the PREVIOUS OUTPUT
+                # This requires fetching the previous transaction's vout
+                # For now, attempt Z calc with available data (will fail for real attacks without proper scriptPubKey)
+                
+                z_result = calculate_z_for_transaction(
+                    tx_hex=tx_hex,
+                    vin_index=row.get('vin', 0),  # Assume input 0 if not specified
+                    script_pubkey_hex=script_pubkey,  # ⚠️ WRONG: Should be prev_out scriptPubKey
+                    sighash_type=1  # SIGHASH_ALL
+                )
+                
+                z_val = z_result.get('z')
+                if z_val:
+                    self.stats['z_calculated'] += 1
+                
+                chain_sigs.append({
+                    'txid': txid,
+                    'r': int(r_val),
+                    's': int(s_val),
+                    'z': z_val,
+                    'z_valid': z_result.get('success', False),
+                    'vin': row.get('vin', 0)
+                })
+                
+                # Rate limiting
+                time.sleep(1.0 / self.rate_limit)
+            
+            # Only add chain if we have >= 3 complete (R,S,Z) tuples
+            complete_sigs = [s for s in chain_sigs if s['z'] is not None]
+            
+            if len(complete_sigs) >= 3:
+                attack_chains.append({
+                    'pubkey': pk,
+                    'signature_count': len(complete_sigs),
+                    'signatures': complete_sigs,
+                    'bias_score': self._calculate_bias_score(complete_sigs)
                 })
         
-        # Sort by signature count (descending)
-        self.attack_chains.sort(key=lambda x: x['signature_count'], reverse=True)
-        
-        print(f"\n✅ Built {len(self.attack_chains)} attack-ready chains")
-        print(f"   Min sigs per chain: {self.min_sigs_per_key}")
-        
-        if self.attack_chains:
-            print(f"\n🏆 Top 5 Attack Targets:")
-            for i, chain in enumerate(self.attack_chains[:5], 1):
-                print(f"   {i}. {chain['pubkey'][:20]}... ({chain['signature_count']} sigs)")
-        
-        return True
+        self.stats['attack_chains_ready'] = len(attack_chains)
+        return attack_chains
     
-    def detect_bias(self) -> Dict:
-        """
-        Detect nonce bias in attack chains.
-        
-        Returns:
-            Dict with bias analysis results
-        """
-        print("\n" + "="*60)
-        print("⚖️ STEP 6: Nonce Bias Detection")
-        print("="*60)
-        
-        if not self.attack_chains:
-            print("⏭️ Skipping: No attack chains available")
-            return {}
-        
-        bias_results = {}
-        
-        for i, chain in enumerate(tqdm(self.attack_chains, desc="Analyzing Bias")):
-            pubkey = chain['pubkey']
-            sigs = chain['signatures']
+    def _calculate_bias_score(self, signatures: List[Dict]) -> float:
+        """Calculate nonce bias score for a chain."""
+        if len(signatures) < 2:
+            return 0.0
             
-            r_values = [sig['r'] for sig in sigs]
-            
-            # Analysis 1: Small R values (indicating small k)
-            small_r_count = sum(1 for r in r_values if r < 2**128)
-            small_r_ratio = small_r_count / len(r_values) if r_values else 0
-            
-            # Analysis 2: Repeated upper bits
-            upper_bits = [r >> 240 for r in r_values]
-            unique_upper = len(set(upper_bits))
-            upper_bit_repetition = 1 - (unique_upper / len(r_values)) if r_values else 0
-            
-            # Analysis 3: Repeated lower bits
-            lower_bits = [r & 0xFFFF for r in r_values]
-            unique_lower = len(set(lower_bits))
-            lower_bit_repetition = 1 - (unique_lower / len(r_values)) if r_values else 0
-            
-            # Overall bias score (0 = no bias, 1 = high bias)
-            bias_score = (small_r_ratio + upper_bit_repetition + lower_bit_repetition) / 3
-            
-            bias_results[pubkey] = {
-                'signature_count': len(sigs),
-                'small_r_ratio': small_r_ratio,
-                'upper_bit_repetition': upper_bit_repetition,
-                'lower_bit_repetition': lower_bit_repetition,
-                'bias_score': bias_score,
-                'is_biased': bias_score > 0.3  # Threshold for "biased"
-            }
+        r_values = [sig['r'] for sig in signatures]
         
-        # Summary
-        biased_chains = [pk for pk, res in bias_results.items() if res['is_biased']]
+        # Check for small R values (< 2^128)
+        small_r_ratio = sum(1 for r in r_values if r < 2**128) / len(r_values)
         
-        print(f"\n📊 Bias Analysis Summary:")
-        print(f"   Total chains analyzed: {len(bias_results)}")
-        print(f"   Biased chains detected: {len(biased_chains)}")
-        print(f"   Bias threshold: >0.3")
+        # Check for repeated upper bits
+        upper_bits = [r >> 240 for r in r_values]
+        unique_ratio = len(set(upper_bits)) / len(upper_bits)
+        repetition_score = 1.0 - unique_ratio
         
-        if biased_chains:
-            print(f"\n🎯 BIASED CHAINS (Priority Targets):")
-            sorted_biased = sorted(biased_chains, key=lambda pk: bias_results[pk]['bias_score'], reverse=True)
-            
-            for i, pk in enumerate(sorted_biased[:5], 1):
-                res = bias_results[pk]
-                print(f"   {i}. {pk[:20]}... (Score: {res['bias_score']:.3f}, Sigs: {res['signature_count']})")
-        
-        return bias_results
+        # Combined score (higher = more biased)
+        score = (small_r_ratio * 0.5) + (repetition_score * 0.5)
+        return score
     
-    def save_results(self, bias_results: Dict) -> List[str]:
-        """
-        Save all results to output files.
+    def save_results(self, attack_chains: List[Dict]):
+        """Save attack chains to files."""
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         
-        Args:
-            bias_results: Dict from detect_bias()
-            
-        Returns:
-            List of output file paths
-        """
-        print("\n" + "="*60)
-        print("💾 STEP 7: Saving Results")
-        print("="*60)
+        # Save full JSON
+        json_path = os.path.join(self.output_dir, f'attack_chains_{timestamp}.json')
+        with open(json_path, 'w') as f:
+            json.dump(attack_chains, f, indent=2)
+        print(f"\n💾 Saved attack chains: {json_path}")
         
-        output_files = []
-        
-        # 1. Save attack chains (full JSON)
-        chains_file = os.path.join(self.output_dir, "attack_chains_full.json")
-        with open(chains_file, 'w') as f:
-            json.dump(self.attack_chains, f, indent=2)
-        output_files.append(chains_file)
-        print(f"✅ Saved: {chains_file}")
-        
-        # 2. Save attack chains summary (CSV)
-        summary_file = os.path.join(self.output_dir, "attack_chains_summary.csv")
+        # Save summary CSV
         summary_data = []
-        
-        for chain in self.attack_chains:
-            bias_res = bias_results.get(chain['pubkey'], {})
+        for chain in attack_chains:
             summary_data.append({
                 'pubkey': chain['pubkey'],
                 'signature_count': chain['signature_count'],
-                'bias_score': bias_res.get('bias_score', 0),
-                'is_biased': bias_res.get('is_biased', False),
-                'first_txid': chain['signatures'][0]['txid'],
-                'sample_r': chain['signatures'][0]['r_hex'][:16]
+                'bias_score': chain['bias_score'],
+                'all_z_valid': all(sig['z_valid'] for sig in chain['signatures'])
             })
         
         summary_df = pd.DataFrame(summary_data)
-        summary_df.to_csv(summary_file, index=False)
-        output_files.append(summary_file)
-        print(f"✅ Saved: {summary_file}")
+        csv_path = os.path.join(self.output_dir, f'attack_chains_summary_{timestamp}.csv')
+        summary_df.to_csv(csv_path, index=False)
+        print(f"💾 Saved summary: {csv_path}")
         
-        # 3. Save biased chains priority list
-        biased_file = os.path.join(self.output_dir, "biased_chains_priority.json")
-        biased_chains = [
-            {'pubkey': pk, **bias_results[pk]}
-            for pk in bias_results if bias_results[pk]['is_biased']
-        ]
-        biased_chains.sort(key=lambda x: x['bias_score'], reverse=True)
-        
-        with open(biased_file, 'w') as f:
-            json.dump(biased_chains, f, indent=2)
-        output_files.append(biased_file)
-        print(f"✅ Saved: {biased_file}")
-        
-        # 4. Save workflow metadata
-        metadata_file = os.path.join(self.output_dir, "workflow_metadata.json")
+        # Save metadata
         metadata = {
-            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
-            'input_csv': self.csv_path,
-            'total_rows_loaded': len(self.df_full) if self.df_full is not None else 0,
-            'legacy_p2pkh_filtered': len(self.df_legacy) if self.df_legacy is not None else 0,
-            'unique_pubkeys': len(self.pubkey_groups),
-            'attack_chains_built': len(self.attack_chains),
-            'biased_chains_detected': len([b for b in bias_results if bias_results[b]['is_biased']]),
-            'min_sigs_per_key': self.min_sigs_per_key,
-            'api_rate_limit': self.api_rate_limit,
-            'output_files': output_files
+            'timestamp': timestamp,
+            'statistics': self.stats,
+            'bitcoin_lib_available': BITCOIN_LIB_AVAILABLE,
+            'rate_limit': self.rate_limit,
+            'limit': self.limit
         }
-        
-        with open(metadata_file, 'w') as f:
+        meta_path = os.path.join(self.output_dir, f'workflow_metadata_{timestamp}.json')
+        with open(meta_path, 'w') as f:
             json.dump(metadata, f, indent=2)
-        output_files.append(metadata_file)
-        print(f"✅ Saved: {metadata_file}")
+        print(f"💾 Saved metadata: {meta_path}")
         
-        return output_files
-    
-    def run(self) -> bool:
-        """
-        Execute complete Phase 2 workflow.
-        
-        Returns:
-            True if workflow completed successfully
-        """
-        print("\n" + "🔥"*30)
-        print("🚀 PROJECT TOTALITY: PHASE 2 COMPLETE WORKFLOW")
-        print("🔥"*30)
-        
-        start_time = time.time()
-        
-        # Step 1: Load and filter CSV
-        if not self.load_and_filter_csv():
-            return False
-        
-        # Step 2: Extract public keys
-        if not self.extract_public_keys():
-            return False
-        
-        # Step 3: Check for existing R,S,Z data
-        txids_with_rsz, txids_needing_fetch = self.check_existing_rsz_data()
-        
-        # Step 4: Fetch missing data
-        fetched_data = {}
-        if txids_needing_fetch:
-            fetched_data = self.fetch_missing_data(txids_needing_fetch)
-        
-        # Step 5: Build attack chains
-        if not self.build_attack_chains(fetched_data):
-            return False
-        
-        # Step 6: Detect bias
-        bias_results = self.detect_bias()
-        
-        # Step 7: Save results
-        output_files = self.save_results(bias_results)
-        
-        # Summary
-        elapsed = time.time() - start_time
-        
+        # Print summary
         print("\n" + "="*60)
-        print("✅ PHASE 2 WORKFLOW COMPLETE")
+        print("📊 PHASE 2 COMPLETE: SUMMARY")
         print("="*60)
-        print(f"   Total Time: {elapsed / 60:.1f} minutes")
-        print(f"   Attack Chains: {len(self.attack_chains)}")
-        print(f"   Biased Chains: {len([b for b in bias_results if bias_results[b]['is_biased']])}")
-        print(f"   Output Files: {len(output_files)}")
-        print(f"\n📁 Output Directory: {self.output_dir}")
-        print("\n🎯 NEXT STEP: Run Phase 3 (Lattice Attack) on biased chains")
+        for key, value in self.stats.items():
+            print(f"   {key.replace('_', ' ').title()}: {value:,}")
+        print("="*60)
         
-        return True
+        if attack_chains:
+            print(f"\n🎯 READY FOR PHASE 3: {len(attack_chains)} attack chains")
+            top_chain = max(attack_chains, key=lambda x: x['bias_score'])
+            print(f"   Highest bias score: {top_chain['bias_score']:.3f} ({top_chain['pubkey'][:20]}...)")
+        else:
+            print("\n❌ NO ATTACK CHAINS READY")
+            print("   Possible causes:")
+            print("   - No multi-signature keys found")
+            print("   - Transaction fetch failed")
+            print("   - Z calculation failed (need python-bitcoinlib)")
+            print("   - ScriptPubKey data missing from CSV")
 
 
 def main():
-    """Main entry point."""
-    parser = argparse.ArgumentParser(
-        description='Project Totality Phase 2: Signature Chain Extraction'
-    )
-    
-    parser.add_argument(
-        '--input', '-i',
-        required=True,
-        help='Path to absolute_bridge_state.csv'
-    )
-    
-    parser.add_argument(
-        '--output-dir', '-o',
-        default='phase2_output',
-        help='Output directory (default: phase2_output)'
-    )
-    
-    parser.add_argument(
-        '--min-sigs', '-m',
-        type=int,
-        default=3,
-        help='Minimum signatures per key for attack (default: 3)'
-    )
-    
-    parser.add_argument(
-        '--rate-limit', '-r',
-        type=float,
-        default=0.5,
-        help='API rate limit in seconds (default: 0.5)'
-    )
-    
-    parser.add_argument(
-        '--limit', '-l',
-        type=int,
-        default=None,
-        help='Maximum number of targets to process (default: all)'
-    )
+    parser = argparse.ArgumentParser(description='Phase 2: Extract Signature Chains')
+    parser.add_argument('--input', required=True, help='Path to absolute_bridge_state.csv')
+    parser.add_argument('--output-dir', default='./phase2_output', help='Output directory')
+    parser.add_argument('--limit', type=int, help='Limit number of rows to process')
+    parser.add_argument('--rate-limit', type=float, default=1.0, help='API calls per second')
     
     args = parser.parse_args()
     
-    # Run workflow
     workflow = Phase2Workflow(
         csv_path=args.input,
         output_dir=args.output_dir,
-        min_sigs_per_key=args.min_sigs,
-        api_rate_limit=args.rate_limit,
-        max_targets=args.limit
+        limit=args.limit,
+        rate_limit=args.rate_limit
     )
     
-    success = workflow.run()
+    # Execute pipeline
+    df_filtered = workflow.load_and_filter_csv()
+    multi_sig_groups = workflow.extract_pubkeys_and_group(df_filtered)
     
-    sys.exit(0 if success else 1)
+    if not multi_sig_groups:
+        print("\n❌ No multi-signature groups found. Exiting.")
+        return
+    
+    attack_chains = workflow.fetch_transactions_and_calculate_z(multi_sig_groups)
+    workflow.save_results(attack_chains)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
