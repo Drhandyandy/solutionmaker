@@ -9,6 +9,16 @@ import struct
 from typing import Tuple, Optional, List
 
 class DerSignatureParser:
+    """
+    Strict DER signature parser for Bitcoin P2PKH transactions.
+    Use parse_script_sig_full() for complete scriptSig parsing.
+    """
+    
+    @staticmethod
+    def parse_scriptsig(script_hex: str) -> dict:
+        """Convenience method to parse full scriptsig."""
+        return parse_script_sig_full(script_hex)
+    
     @staticmethod
     def parse_der_signature(sig_hex: str) -> Optional[Tuple[int, int]]:
         """
@@ -149,7 +159,8 @@ class DerSignatureParser:
             return None
 
 
-# Alias for backward compatibility
+# Aliases for backward compatibility
+RealDERParser = DerSignatureParser
 DERParser = DerSignatureParser
 
 
