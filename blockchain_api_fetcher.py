@@ -18,6 +18,12 @@ import hashlib
 from ecdsa.util import sigdecode_der
 from ecdsa.curves import SECP256k1
 
+# Import Z calculator to check library availability
+try:
+    from z_calculator import BITCOIN_LIB_AVAILABLE
+except ImportError:
+    BITCOIN_LIB_AVAILABLE = False
+
 # Constants
 P_GATEKEEPER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
 N_CURVE_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
@@ -268,28 +274,62 @@ class BlockchainAPIFetcher:
             print(f"⚠️ Signature extraction failed: {e}")
             return None
     
-    def _calculate_message_hash(self, tx_data: Dict, vin: Dict, vout_index: int) -> int:
+    def _calculate_message_hash(self, tx_data: Dict, vin: Dict, vout_index: int) -> Optional[int]:
         """
         Calculate the message hash (Z) for a transaction input.
-        
-        This is a simplified implementation. For accurate Z calculation,
-        you need to serialize the transaction according to Bitcoin protocol
-        rules (handling sighash types, previous outputs, etc.).
-        
-        For production use, consider using the 'bitcoin' library:
-        pip install python-bitcoinlib
+        Uses python-bitcoinlib for cryptographic accuracy.
+        Falls back to estimation only if library unavailable.
         """
         try:
-            # Simplified: Use the transaction's own hash as approximation
-            # This is NOT cryptographically correct for HNP attacks!
-            # You MUST implement proper sighash calculation for real attacks.
+            # Get scriptPubKey from the previous output being spent
+            prev_txid = vin.get('txid')  # The TXID of the UTXO being spent
+            prev_vout = vin.get('vout', 0)  # The output index being spent
             
-            txid = tx_data.get('txid', '')
-            if txid:
-                # Return txid as integer (placeholder - NOT REAL Z)
-                return int(txid[:16], 16)  # First 8 bytes as placeholder
+            if not prev_txid:
+                print(f"⚠️ Cannot calculate Z: Missing previous txid")
+                return None
             
-            return None
+            # Fetch the previous transaction to get its scriptPubKey
+            prev_tx_data = self.fetch_transaction(prev_txid, verbose=False)
+            if not prev_tx_data:
+                print(f"⚠️ Cannot calculate Z: Failed to fetch previous tx {prev_txid[:16]}...")
+                return None
+            
+            # Get the scriptPubKey from the previous output
+            vouts = prev_tx_data.get('vout', [])
+            if prev_vout >= len(vouts):
+                print(f"⚠️ Cannot calculate Z: vout {prev_vout} out of range")
+                return None
+            
+            script_pubkey_hex = vouts[prev_vout].get('scriptpubkey', '')
+            if not script_pubkey_hex:
+                print(f"⚠️ Cannot calculate Z: Empty scriptPubKey")
+                return None
+            
+            # Get current transaction hex
+            tx_hex = tx_data.get('hex', '')
+            if not tx_hex:
+                print(f"⚠️ Cannot calculate Z: Missing transaction hex")
+                return None
+            
+            # Use ZCalculator for accurate computation
+            from z_calculator import ZCalculator, SIGHASH_ALL
+            
+            # Parse sighash type from signature if possible
+            scriptsig = vin.get('scriptsig', '')
+            sighash_type = ZCalculator.parse_sighash_from_script_sig(scriptsig)
+            
+            z = ZCalculator.calculate_z_bitcoinlib(
+                tx_hex=tx_hex,
+                vin_index=vout_index,
+                script_pubkey_hex=script_pubkey_hex,
+                sighash_type=sighash_type
+            )
+            
+            if z is None and BITCOIN_LIB_AVAILABLE:
+                print(f"⚠️ Z calculation returned None for {tx_data.get('txid', 'unknown')[:16]}...")
+            
+            return z
             
         except Exception as e:
             print(f"⚠️ Message hash calculation failed: {e}")

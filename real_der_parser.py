@@ -19,27 +19,33 @@ class DerSignatureParser:
             if not sig_hex or len(sig_hex) < 10:
                 return None
             
-            # Remove potential SIGHASH flag (last 2 hex chars = 1 byte) if length is odd or specific pattern
-            # Usually DER sigs in scriptSig are followed by a sighash byte. 
-            # Standard DER structure: 30 [Total Len] 02 [R Len] [R] 02 [S Len] [S] [Sighash?]
-            
             data = bytes.fromhex(sig_hex)
             
-            # Check for SIGHASH flag (usually 01, 02, 03, 81, 82, 83). 
-            # If the last byte looks like a sighash and the preceding structure is valid DER, strip it.
-            # Heuristic: If total length > declared length + 2, last byte might be sighash.
-            # More robust: Try parsing as pure DER first. If fails, strip last byte.
-            
-            r, s = DerSignatureParser._parse_der_bytes(data)
-            if r and s:
-                return r, s
-            
-            # Try stripping last byte (SIGHASH)
-            if len(data) > 1:
-                r, s = DerSignatureParser._parse_der_bytes(data[:-1])
+            # Check if last byte looks like a sighash flag and remove it
+            # Valid sighash flags: 0x01, 0x02, 0x03, 0x81, 0x82, 0x83
+            sighash_flags = {0x01, 0x02, 0x03, 0x81, 0x82, 0x83}
+            if len(data) > 1 and data[-1] in sighash_flags:
+                test_data = data[:-1]
+                if test_data[0] == 0x30:
+                    # Try parsing without sighash first
+                    r, s = DerSignatureParser._parse_der_bytes(test_data)
+                    if r and s:
+                        return r, s
+                    # If that fails, try with sighash included
+                    r, s = DerSignatureParser._parse_der_bytes(data)
+                    if r and s:
+                        return r, s
+                else:
+                    # Not starting with 0x30, try raw data
+                    r, s = DerSignatureParser._parse_der_bytes(data)
+                    if r and s:
+                        return r, s
+            else:
+                # No sighash flag, parse as-is
+                r, s = DerSignatureParser._parse_der_bytes(data)
                 if r and s:
                     return r, s
-                    
+                
             return None
         except Exception:
             return None
@@ -145,15 +151,33 @@ class DerSignatureParser:
 def parse_script_sig_full(script_hex: str) -> dict:
     """
     Full parser: Returns { 'r': int, 's': int, 'pubkey': str }
+    Handles both space-separated and continuous hex formats.
     """
     if not script_hex:
         return {}
     
-    # Split scriptSig into components? 
-    # If the hex is a raw script, we need to parse opcodes.
-    # Standard P2PKH ScriptSig: <sig> <pubkey>
-    # Hex: [LenSig][SigBytes][LenPk][PkBytes]
+    # Check if space-separated (common in CSV exports)
+    if ' ' in script_hex:
+        parts = script_hex.strip().split()
+        if len(parts) >= 2:
+            sig_part = parts[0]
+            pk_part = parts[-1]
+            
+            result = {}
+            
+            # Parse signature
+            rs = DerSignatureParser.parse_der_signature(sig_part)
+            if rs:
+                result['r'], result['s'] = rs
+            
+            # Extract pubkey
+            pk = DerSignatureParser.extract_pubkey_from_script_sig(pk_part)
+            if pk:
+                result['pubkey'] = pk
+                
+            return result
     
+    # Continuous hex format - parse opcodes
     try:
         data = bytes.fromhex(script_hex)
         cursor = 0
